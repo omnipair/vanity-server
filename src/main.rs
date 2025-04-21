@@ -42,7 +42,10 @@ pub struct GrindArgs {
 
     /// The target prefix for the pubkey
     #[clap(long)]
-    pub target: String,
+    pub prefix: Option<String>,
+
+    #[clap(long)]
+    pub suffix: Option<String>,
 
     /// Whether user cares about the case of the pubkey
     #[clap(long, default_value_t = false)]
@@ -131,7 +134,6 @@ fn deploy(args: DeployArgs) {
 
     // Target
     let target = Pubkey::create_with_seed(&base_keypair.pubkey(), &args.seed, &args.owner).unwrap();
-
     // Fetch rent
     let rpc_client = RpcClient::new(args.rpc);
     // this is such a dumb way to do this
@@ -212,8 +214,8 @@ pub fn deploy_with_max_program_len_with_seed(
 
 fn grind(mut args: GrindArgs) {
     maybe_update_num_cpus(&mut args.num_cpus);
-
-    let target = get_validated_target(&args);
+    let prefix = get_validated_prefix(&args);
+    let suffix = get_validated_suffix(&args);
 
     // Initialize logger with optional logfile
     let mut logger = Logger::new();
@@ -252,7 +254,7 @@ fn grind(mut args: GrindArgs) {
                         let seed = new_gpu_seed(gpu_index, iteration);
                         let timer = Instant::now();
                         unsafe {
-                            vanity_round(gpu_index, seed.as_ref().as_ptr(), args.base.to_bytes().as_ptr(), args.owner.to_bytes().as_ptr(), target.as_ptr(), target.len() as u64, out.as_mut_ptr(), args.case_insensitive);
+                            vanity_round(gpu_index, seed.as_ref().as_ptr(), args.base.to_bytes().as_ptr(), args.owner.to_bytes().as_ptr(), prefix.as_ptr(), suffix.as_ptr(), prefix.len() as u64, suffix.len() as u64,out.as_mut_ptr(), args.case_insensitive);
                         }
                         let time_sec = timer.elapsed().as_secs_f64();
 
@@ -267,14 +269,14 @@ fn grind(mut args: GrindArgs) {
                         let out_str_target_check = maybe_bs58_aware_lowercase(&out_str, args.case_insensitive);
                         let count = u64::from_le_bytes(array::from_fn(|i| out[16 + i]));
                         logfather::info!(
-                            "{}.. found in {:.3} seconds on gpu {gpu_index:>3}; {:>13} iters; {:>12} iters/sec",
-                            &out_str[..(target.len() + 4).min(40)],
+                            "{} found in {:.3} seconds on gpu {gpu_index:>3}; {:>13} iters; {:>12} iters/sec",
+                            &out_str,
                             time_sec,
                             count.to_formatted_string(&Locale::en),
                             ((count as f64 / time_sec) as u64).to_formatted_string(&Locale::en)
                         );
 
-                        if out_str_target_check.starts_with(target) {
+                        if out_str_target_check.starts_with(prefix) && out_str_target_check.ends_with(suffix) {
                             logfather::info!("out seed = {out:?} -> {}", core::str::from_utf8(&out[..16]).unwrap());
                             EXIT.store(true, Ordering::SeqCst);
                             logfather::trace!("gpu thread {gpu_index} exiting");
@@ -311,7 +313,7 @@ fn grind(mut args: GrindArgs) {
             count += 1;
 
             // Did cpu find target?
-            if out_str_target_check.starts_with(target) {
+            if out_str_target_check.starts_with(prefix) && out_str_target_check.ends_with(suffix) {
                 let time_secs = timer.elapsed().as_secs_f64();
                 logfather::info!(
                     "cpu {i} found target: {pubkey}; {seed:?} -> {} in {:.3}s; {} attempts; {} attempts per second",
@@ -328,7 +330,7 @@ fn grind(mut args: GrindArgs) {
     });
 }
 
-fn get_validated_target(args: &GrindArgs) -> &'static str {
+fn get_validated_prefix(args: &GrindArgs) -> &'static str {
     // Static string of BS58 characters
     const BS58_CHARS: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
@@ -336,18 +338,42 @@ fn get_validated_target(args: &GrindArgs) -> &'static str {
     //
     // maybe TODO: technically we could accept I or o if case-insensitivity but I suspect
     // most users will provide lowercase targets for case-insensitive searches
-    for c in args.target.chars() {
-        assert!(
-            BS58_CHARS.contains(c),
-            "your target contains invalid bs58: {}",
-            c
-        );
+
+    if let Some(ref prefix) = args.prefix {
+        for c in prefix.chars() {
+            assert!(
+                BS58_CHARS.contains(c),
+                "your prefix contains invalid bs58: {}",
+                c
+            );
+        }
+        let prefix = maybe_bs58_aware_lowercase(&prefix, args.case_insensitive);
+        return prefix.leak()
     }
+    ""
+}
 
-    // bs58-aware lowercase converison
-    let target = maybe_bs58_aware_lowercase(&args.target, args.case_insensitive);
+fn get_validated_suffix(args: &GrindArgs) -> &'static str {
+    // Static string of BS58 characters
+    const BS58_CHARS: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-    target.leak()
+    // Validate target (i.e. does it include 0, O, I, l)
+    //
+    // maybe TODO: technically we could accept I or o if case-insensitivity but I suspect
+    // most users will provide lowercase targets for case-insensitive searches
+
+    if let Some(ref suffix) = args.suffix {
+        for c in suffix.chars() {
+            assert!(
+                BS58_CHARS.contains(c),
+                "your suffix contains invalid bs58: {}",
+                c
+            );
+        }
+        let suffix = maybe_bs58_aware_lowercase(&suffix, args.case_insensitive);
+        return suffix.leak()
+    }
+    ""
 }
 
 fn maybe_bs58_aware_lowercase(target: &str, case_insensitive: bool) -> String {
@@ -377,7 +403,9 @@ extern "C" {
         base: *const u8,
         owner: *const u8,
         target: *const u8,
+        suffix: *const u8,
         target_len: u64,
+        suffix_len: u64,
         out: *mut u8,
         case_insensitive: bool,
     );

@@ -17,7 +17,9 @@ extern "C" void vanity_round(
     uint8_t *base,
     uint8_t *owner,
     char *target,
+    char *suffix,
     uint64_t target_len,
+    uint64_t suffix_len,
     uint8_t *out,
     bool case_insensitive)
 {
@@ -41,9 +43,12 @@ extern "C" void vanity_round(
         32               // seed
             + 32         // base
             + 32         // owner
-            + 8          // target len
             + target_len // target
+            + suffix_len // suffix
+            + 8          // target len
+            + 8          // suffix len
             + 16         // out (16 byte seed)
+
     );
     if (err != cudaSuccess)
     {
@@ -86,7 +91,24 @@ extern "C" void vanity_round(
         cudaFree(d_buffer);
         return;
     }
+
+    err = cudaMemcpy(d_buffer + 104 + target_len, &suffix_len, 8, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess)
+    {
+        printf("CUDA memcpy error (suffix_len): %s\n", cudaGetErrorString(err));
+        cudaFree(d_buffer);
+        return;
+    }
+    err = cudaMemcpy(d_buffer + 104 + target_len + 8, suffix, suffix_len, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess)
+    {
+        printf("CUDA memcpy error (suffix): %s\n", cudaGetErrorString(err));
+        cudaFree(d_buffer);
+        return;
+    }
+
     err = cudaMemcpyToSymbol(d_case_insensitive, &case_insensitive, 1, 0, cudaMemcpyHostToDevice);
+
 
     // Reset tracker and counter using cudaMemcpyToSymbol
     int zero = 0;
@@ -119,7 +141,7 @@ extern "C" void vanity_round(
     }
 
     // Copy result to host
-    err = cudaMemcpy(out, d_buffer + 104 + target_len, 16, cudaMemcpyDeviceToHost);
+    err = cudaMemcpy(out, d_buffer + 104 + target_len + suffix_len + 8, 16, cudaMemcpyDeviceToHost);
     if (err != cudaSuccess)
     {
         printf("CUDA memcpy error (d_out): %s\n", cudaGetErrorString(err));
@@ -150,7 +172,10 @@ vanity_search(uint8_t *buffer, uint64_t stride)
     uint64_t target_len;
     memcpy(&target_len, buffer + 96, 8);
     uint8_t *target = buffer + 104;
-    uint8_t *out = (buffer + 104 + target_len);
+    uint64_t suffix_len;
+    memcpy(&suffix_len, buffer + 104 + target_len, 8);
+    uint8_t *suffix = buffer + 104 + target_len + 8;
+    uint8_t *out = (buffer + 104 + target_len + suffix_len + 8);
 
     uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned char local_out[32] = {0};
@@ -213,7 +238,8 @@ vanity_search(uint8_t *buffer, uint64_t stride)
         fd_base58_encode_32(local_out, (unsigned char *)(&local_encoded), d_case_insensitive);
 
         // Check target
-        if (matches_target((unsigned char *)local_encoded, (unsigned char *)target, target_len))
+        if (matches_target((unsigned char *)local_encoded, (unsigned char *)target, target_len, (unsigned char *)suffix, suffix_len))
+        
         {
             // Are we first to write result?
             if (atomicMax(&done, 1) == 0)
@@ -228,11 +254,23 @@ vanity_search(uint8_t *buffer, uint64_t stride)
     }
 }
 
-__device__ bool matches_target(unsigned char *a, unsigned char *target, uint64_t n)
+__device__ int my_strlen(const char *str) {
+    int len = 0;
+    while (str[len] != '\0') len++;
+    return len;
+}
+
+__device__ bool matches_target(unsigned char *a, unsigned char *target, uint64_t n, unsigned char *suffix, uint64_t suffix_len)
 {
     for (int i = 0; i < n; i++)
     {
         if (a[i] != target[i])
+            return false;
+    }
+    uint64_t x = my_strlen((char *)a);
+    for (int i = 0; i < suffix_len; i++)
+    {
+        if (a[x - suffix_len + i - 1] != suffix[i])
             return false;
     }
     return true;

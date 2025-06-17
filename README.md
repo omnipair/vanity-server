@@ -59,7 +59,11 @@ yes
 
 ## Performance
 
-one of y'all can fill this out. RTX 4090 does ≈1 billion address searches per second.
+**Update@06/07/25:** Ran a 2x RTX 4090 setup and it did 900-910 million searchers per second (15 threads, 2 gpus running at 95.81% and 100%)
+
+You can run a test grind to get your speed output from the configuration you are running.
+
+![benchmark](https://github.com/user-attachments/assets/876c73d1-b824-491a-a8ed-ced997c0a048)
 
 ## Acknowledgements, External Libraries
 

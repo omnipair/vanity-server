@@ -5,20 +5,23 @@ use rand::{distributions::Alphanumeric, Rng};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use sha2::{Digest, Sha256};
 use solana_pubkey::Pubkey;
-use solana_rpc_client::rpc_client::RpcClient;
-use solana_sdk::{
-    bpf_loader_upgradeable::{self, get_program_data_address, UpgradeableLoaderState},
-    instruction::{AccountMeta, Instruction},
-    loader_upgradeable_instruction::UpgradeableLoaderInstruction,
-    signature::read_keypair_file,
-    signer::Signer,
-    system_instruction, system_program, sysvar,
-    transaction::Transaction,
+#[cfg(feature = "deploy")]
+use {
+    solana_rpc_client::rpc_client::RpcClient,
+    solana_sdk::{
+        bpf_loader_upgradeable::{self, get_program_data_address, UpgradeableLoaderState},
+        instruction::{AccountMeta, Instruction},
+        loader_upgradeable_instruction::UpgradeableLoaderInstruction,
+        signature::read_keypair_file,
+        signer::Signer,
+        system_instruction, system_program, sysvar,
+        transaction::Transaction,
+    },
+    std::path::PathBuf,
 };
 
 use std::{
     array,
-    path::PathBuf,
     str::FromStr,
     sync::atomic::{AtomicBool, Ordering},
     time::Instant,
@@ -27,6 +30,8 @@ use std::{
 #[derive(Debug, Parser)]
 pub enum Command {
     Grind(GrindArgs),
+    Verify(VerifyArgs),
+    #[cfg(feature = "deploy")]
     Deploy(DeployArgs),
 }
 
@@ -65,6 +70,22 @@ pub struct GrindArgs {
     pub num_cpus: u32,
 }
 
+#[derive(Debug, Parser)]
+pub struct VerifyArgs {
+    /// The pubkey that will be the signer for the CreateAccountWithSeed instruction
+    #[clap(long, value_parser = parse_pubkey)]
+    pub base: Pubkey,
+
+    /// The account owner, e.g. BPFLoaderUpgradeab1e11111111111111111111111 or TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA
+    #[clap(long, value_parser = parse_pubkey)]
+    pub owner: Pubkey,
+
+    /// The seed to verify
+    #[clap(long)]
+    pub seed: String,
+}
+
+#[cfg(feature = "deploy")]
 #[derive(Debug, Parser)]
 pub struct DeployArgs {
     /// The keypair that will be the signer for the CreateAccountWithSeed instruction
@@ -116,12 +137,30 @@ fn main() {
             grind(args);
         }
 
+        Command::Verify(args) => {
+            verify(args);
+        }
+
+        #[cfg(feature = "deploy")]
         Command::Deploy(args) => {
             deploy(args);
         }
     }
 }
 
+fn verify(args: VerifyArgs) {
+    // Unpack create with seed arguments
+    let VerifyArgs { base, owner, seed } = args;
+
+    let result = Pubkey::create_with_seed(&base, &seed, &owner).unwrap();
+    println!("Results:");
+    println!("  base  {base}");
+    println!("  owner {owner}");
+    println!("  seed  {seed}\n");
+    println!("  resulting pubkey: {result}")
+}
+
+#[cfg(feature = "deploy")]
 fn deploy(args: DeployArgs) {
     // Load base and payer keypair
     let base_keypair = read_keypair_file(&args.base).expect("failed to read base keypair");
@@ -174,6 +213,7 @@ fn deploy(args: DeployArgs) {
     println!("Deployed {target}: {sig}");
 }
 
+#[cfg(feature = "deploy")]
 pub fn deploy_with_max_program_len_with_seed(
     payer_address: &Pubkey,
     program_address: &Pubkey,
@@ -348,7 +388,7 @@ fn get_validated_prefix(args: &GrindArgs) -> &'static str {
             );
         }
         let prefix = maybe_bs58_aware_lowercase(&prefix, args.case_insensitive);
-        return prefix.leak()
+        return prefix.leak();
     }
     ""
 }
@@ -371,7 +411,7 @@ fn get_validated_suffix(args: &GrindArgs) -> &'static str {
             );
         }
         let suffix = maybe_bs58_aware_lowercase(&suffix, args.case_insensitive);
-        return suffix.leak()
+        return suffix.leak();
     }
     ""
 }

@@ -59,15 +59,7 @@ yes
 
 ## Performance
 
-**Update@06/07/25:** Ran a 2x RTX 4090 setup and it did 900-910 million searchers per second per GPU
-
-You can run a test grind to get your speed output from the configuration you are running.
-
-- 2x RTX 4090 running at 100% solved case-sensitive lens-6 in 25.992 seconds
-
-- 2x RTX 4090 running at 100% solved case-sensitive lens-8 in 5700 seconds (1100 seconds on 2nd attempt)
-
-![benchmark](https://github.com/user-attachments/assets/876c73d1-b824-491a-a8ed-ced997c0a048)
+**Update@06/27/25:** Ran a 14x RTX 4090 setup and it did 1.2-1.3 billion searches per second per GPU
 
 ## Acknowledgements, External Libraries
 

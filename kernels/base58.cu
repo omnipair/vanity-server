@@ -97,7 +97,7 @@ __device__ uint const enc_table_32[BINARY_SZ][INTERMEDIATE_SZ - 1UL] = {
 #define INTERMEDIATE_SZ_W_PADDING INTERMEDIATE_SZ
 #endif
 
-__device__ void fd_base58_encode_32(uint8_t *bytes,
+__device__ ulong fd_base58_encode_32(uint8_t *bytes,
                                     uint8_t *out,
                                     bool case_insensitive)
 {
@@ -218,10 +218,14 @@ __device__ void fd_base58_encode_32(uint8_t *bytes,
     }
 
     ulong skip = raw_leading_0s - in_leading_0s;
-    for (ulong i = 0UL; i < RAW58_SZ - skip; i++)
+    ulong encoded_length = RAW58_SZ - skip;
+    
+    for (ulong i = 0UL; i < encoded_length; i++)
         out[i] = b58_chars[raw_base58[skip + i]];
+    
+    out[encoded_length] = '\0';
 
-    // out[RAW58_SZ - skip] = '\0';
+    return encoded_length;
 }
 
 #undef RAW58_SZ

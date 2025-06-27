@@ -3,6 +3,46 @@
 #include "vanity.h"
 #include "sha256.h"
 
+// ------------------------------------------------------------------
+// XorShift128+ PRNG state & helper functions (fast per-thread RNG)
+struct xorshift128plus_state {
+    uint64_t s[2];
+};
+
+__device__ void init_xorshift(xorshift128plus_state &st,
+                              const uint8_t *seed,   // 32-byte GPU seed
+                              uint64_t idx)
+{
+    // Extract all four 64-bit values from the 32-byte seed
+    uint64_t k0 = *((const uint64_t*)(seed + 0));
+    uint64_t k1 = *((const uint64_t*)(seed + 8));
+    uint64_t k2 = *((const uint64_t*)(seed + 16));
+    uint64_t k3 = *((const uint64_t*)(seed + 24));
+
+    // Mix k0 and k2 with idx for s[0]
+    uint64_t z0 = k0 ^ k2;  // Combine both parts
+    z0 += idx;
+    z0 = (z0 ^ (z0 >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z0 = (z0 ^ (z0 >> 27)) * 0x94d049bb133111ebULL;
+    st.s[0] = z0 ^ (z0 >> 31);
+
+    // Mix k1 and k3 with idx (and golden ratio) for s[1]
+    uint64_t z1 = k1 ^ k3;  // Combine both parts
+    z1 += idx + 0x9e3779b97f4a7c15ULL;
+    z1 = (z1 ^ (z1 >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z1 = (z1 ^ (z1 >> 27)) * 0x94d049bb133111ebULL;
+    st.s[1] = z1 ^ (z1 >> 31);
+}
+
+__device__ uint64_t xorshift128plus_next(xorshift128plus_state &st) {
+    uint64_t s1 = st.s[0], s0 = st.s[1];
+    uint64_t result = s0 + s1;
+    st.s[0] = s0;
+    s1 ^= s1 << 23;
+    st.s[1] = (s1 ^ s0 ^ (s1 >> 18) ^ (s0 >> 5));
+    return result;
+}
+
 __device__ int done = 0;
 __device__ unsigned long long count = 0;
 
@@ -17,7 +57,9 @@ extern "C" void vanity_round(
     uint8_t *base,
     uint8_t *owner,
     char *target,
+    char *suffix,
     uint64_t target_len,
+    uint64_t suffix_len,
     uint8_t *out,
     bool case_insensitive)
 {
@@ -41,9 +83,12 @@ extern "C" void vanity_round(
         32               // seed
             + 32         // base
             + 32         // owner
-            + 8          // target len
             + target_len // target
+            + suffix_len // suffix
+            + 8          // target len
+            + 8          // suffix len
             + 16         // out (16 byte seed)
+
     );
     if (err != cudaSuccess)
     {
@@ -86,7 +131,24 @@ extern "C" void vanity_round(
         cudaFree(d_buffer);
         return;
     }
+
+    err = cudaMemcpy(d_buffer + 104 + target_len, &suffix_len, 8, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess)
+    {
+        printf("CUDA memcpy error (suffix_len): %s\n", cudaGetErrorString(err));
+        cudaFree(d_buffer);
+        return;
+    }
+    err = cudaMemcpy(d_buffer + 104 + target_len + 8, suffix, suffix_len, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess)
+    {
+        printf("CUDA memcpy error (suffix): %s\n", cudaGetErrorString(err));
+        cudaFree(d_buffer);
+        return;
+    }
+
     err = cudaMemcpyToSymbol(d_case_insensitive, &case_insensitive, 1, 0, cudaMemcpyHostToDevice);
+
 
     // Reset tracker and counter using cudaMemcpyToSymbol
     int zero = 0;
@@ -119,7 +181,7 @@ extern "C" void vanity_round(
     }
 
     // Copy result to host
-    err = cudaMemcpy(out, d_buffer + 104 + target_len, 16, cudaMemcpyDeviceToHost);
+    err = cudaMemcpy(out, d_buffer + 104 + target_len + suffix_len + 8, 16, cudaMemcpyDeviceToHost);
     if (err != cudaSuccess)
     {
         printf("CUDA memcpy error (d_out): %s\n", cudaGetErrorString(err));
@@ -150,25 +212,24 @@ vanity_search(uint8_t *buffer, uint64_t stride)
     uint64_t target_len;
     memcpy(&target_len, buffer + 96, 8);
     uint8_t *target = buffer + 104;
-    uint8_t *out = (buffer + 104 + target_len);
+    uint64_t suffix_len;
+    memcpy(&suffix_len, buffer + 104 + target_len, 8);
+    uint8_t *suffix = buffer + 104 + target_len + 8;
+    uint8_t *out = (buffer + 104 + target_len + suffix_len + 8);
 
     uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned char local_out[32] = {0};
     unsigned char local_encoded[44] = {0};
-    uint64_t local_seed[4];
 
-    // Pseudo random generator
-    CUDA_SHA256_CTX ctx;
-    cuda_sha256_init(&ctx);
-    cuda_sha256_update(&ctx, (BYTE *)(seed), 32);
-    cuda_sha256_update(&ctx, (BYTE *)(&idx), 8);
-    cuda_sha256_final(&ctx, (BYTE *)local_seed);
+    // Initialize XorShift128+ state
+    xorshift128plus_state st;
+    init_xorshift(st, seed, idx);
 
     CUDA_SHA256_CTX address_sha;
     cuda_sha256_init(&address_sha);
     cuda_sha256_update(&address_sha, (BYTE *)base, 32);
 
-    for (uint64_t iter = 0; iter < 1000 * 1000 * 1000 * 1000; iter++)
+    for (uint64_t iter = 0; iter < uint64_t(1000) * 1000 * 1000 * 1000; iter++)
     {
         // Has someone found a result?
         if (iter % 100 == 0)
@@ -180,29 +241,15 @@ vanity_search(uint8_t *buffer, uint64_t stride)
             }
         }
 
-        cuda_sha256_init(&ctx);
-        cuda_sha256_update(&ctx, (BYTE *)local_seed, 16);
-        cuda_sha256_final(&ctx, (BYTE *)local_seed);
-
-        uint32_t *indices = (uint32_t *)&local_seed;
-        uint8_t create_account_seed[16] = {
-            alphanumeric[indices[0] % 62],
-            alphanumeric[indices[1] % 62],
-            alphanumeric[indices[2] % 62],
-            alphanumeric[indices[3] % 62],
-            alphanumeric[indices[4] % 62],
-            alphanumeric[indices[5] % 62],
-            alphanumeric[indices[6] % 62],
-            alphanumeric[indices[7] % 62],
-            alphanumeric[(indices[0] >> 2) % 62],
-            alphanumeric[(indices[1] >> 2) % 62],
-            alphanumeric[(indices[2] >> 2) % 62],
-            alphanumeric[(indices[3] >> 2) % 62],
-            alphanumeric[(indices[4] >> 2) % 62],
-            alphanumeric[(indices[5] >> 2) % 62],
-            alphanumeric[(indices[6] >> 2) % 62],
-            alphanumeric[(indices[7] >> 2) % 62],
-        };
+        // generate 16-byte create_account_seed via XorShift128+
+        uint8_t create_account_seed[16];
+        for (int i = 0; i < 2; ++i) {
+            uint64_t rnd = xorshift128plus_next(st);
+            for (int b = 0; b < 8; ++b) {
+                uint8_t idx8 = (rnd >> (b * 8)) & 0xFF;
+                create_account_seed[i * 8 + b] = alphanumeric[idx8 % 62];
+            }
+        }
 
         // Calculate and encode public
         CUDA_SHA256_CTX address_sha_local;
@@ -210,10 +257,11 @@ vanity_search(uint8_t *buffer, uint64_t stride)
         cuda_sha256_update(&address_sha_local, (BYTE *)create_account_seed, 16);
         cuda_sha256_update(&address_sha_local, (BYTE *)owner, 32);
         cuda_sha256_final(&address_sha_local, (BYTE *)local_out);
-        fd_base58_encode_32(local_out, (unsigned char *)(&local_encoded), d_case_insensitive);
+        ulong encoded_len = fd_base58_encode_32(local_out, (unsigned char *)(&local_encoded), d_case_insensitive);
 
         // Check target
-        if (matches_target((unsigned char *)local_encoded, (unsigned char *)target, target_len))
+        if (matches_target((unsigned char *)local_encoded, (unsigned char *)target, target_len, (unsigned char *)suffix, suffix_len, encoded_len))
+        
         {
             // Are we first to write result?
             if (atomicMax(&done, 1) == 0)
@@ -228,11 +276,22 @@ vanity_search(uint8_t *buffer, uint64_t stride)
     }
 }
 
-__device__ bool matches_target(unsigned char *a, unsigned char *target, uint64_t n)
+__device__ int my_strlen(const char *str) {
+    int len = 0;
+    while (str[len] != '\0') len++;
+    return len;
+}
+
+__device__ bool matches_target(unsigned char *a, unsigned char *target, uint64_t n, unsigned char *suffix, uint64_t suffix_len, ulong encoded_len)
 {
     for (int i = 0; i < n; i++)
     {
         if (a[i] != target[i])
+            return false;
+    }
+    for (int i = 0; i < suffix_len; i++)
+    {
+        if (a[encoded_len - suffix_len + i] != suffix[i])
             return false;
     }
     return true;

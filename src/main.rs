@@ -33,6 +33,8 @@ pub enum Command {
     Verify(VerifyArgs),
     #[cfg(feature = "deploy")]
     Deploy(DeployArgs),
+    #[cfg(feature = "server")]
+    Server(ServerArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -85,6 +87,14 @@ pub struct VerifyArgs {
     pub seed: String,
 }
 
+#[cfg(feature = "server")]
+#[derive(Debug, Parser)]
+pub struct ServerArgs {
+    /// Port to run the HTTP server on (overrides VANITY_PORT env var)
+    #[clap(long)]
+    pub port: Option<u16>,
+}
+
 #[cfg(feature = "deploy")]
 #[derive(Debug, Parser)]
 pub struct DeployArgs {
@@ -127,6 +137,9 @@ pub struct DeployArgs {
 
 static EXIT: AtomicBool = AtomicBool::new(false);
 
+#[cfg(feature = "server")]
+mod server;
+
 fn main() {
     rayon::ThreadPoolBuilder::new().build_global().unwrap();
 
@@ -144,6 +157,16 @@ fn main() {
         #[cfg(feature = "deploy")]
         Command::Deploy(args) => {
             deploy(args);
+        }
+
+        #[cfg(feature = "server")]
+        Command::Server(args) => {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                if let Err(e) = server::start_server(args).await {
+                    eprintln!("Server error: {}", e);
+                    std::process::exit(1);
+                }
+            });
         }
     }
 }

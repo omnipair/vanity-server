@@ -12,6 +12,7 @@ description = "A *bLaZinGlY fAsT* tool for grinding vanity addresses on Solana"
 [features]
 gpu = ["cc"]
 deploy = ["solana-rpc-client"]
+server = ["axum", "tokio", "serde", "serde_json", "tower", "tower-http", "uuid", "chrono", "dotenvy"]
 default = []
 
 [profile.release]
@@ -30,6 +31,15 @@ sha2 = "0.10.8"
 solana-pubkey = { version = "2.1.0", features = ["sha2"] }
 solana-rpc-client = { version = "2.1.0", optional = true }
 solana-sdk = { version = "2.1.0", optional = true }
+axum = { version = "0.7", optional = true }
+tokio = { version = "1.0", features = ["full"], optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
+tower = { version = "0.4", optional = true }
+tower-http = { version = "0.5", features = ["cors", "trace"], optional = true }
+uuid = { version = "1.0", features = ["v4"], optional = true }
+chrono = { version = "0.4", features = ["serde"], optional = true }
+dotenvy = { version = "0.15", optional = true }
 
 [build-dependencies]
 cc = { version = "1.0.98", optional = true }

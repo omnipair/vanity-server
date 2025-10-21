@@ -53,6 +53,55 @@ pub fn create_account_with_seed(
 ) -> Instruction
 ```
 
+## HTTP Server Mode
+
+The vanity tool can also run as an HTTP server to provide a REST API for grinding vanity addresses.
+
+### Build and Run Server
+
+```bash
+# Build with server feature
+cargo build --release --features server
+
+# Start server on default port 8080
+cargo run --release --features server -- server
+
+# Start server on custom port
+cargo run --release --features server -- server --port 3000
+```
+
+### API Usage
+
+**Get API documentation:**
+```bash
+curl -X GET http://localhost:8080/
+```
+
+**Grind vanity addresses (synchronous):**
+```bash
+curl -X GET http://localhost:8080/grind
+```
+
+**Health check:**
+```bash
+curl -X GET http://localhost:8080/health
+```
+
+See [API.md](API.md) for complete API documentation with examples in multiple programming languages.
+
+### Environment Configuration
+
+The server supports configuration via environment variables. Copy `.env.example` to `.env` and modify as needed:
+
+```bash
+cp .env.example .env
+# Edit .env file with your settings
+```
+
+Available environment variables:
+- `VANITY_PORT` - Server port (default: 8080)
+- Additional variables documented in `.env.example`
+
 ## Contributions
 
 yes

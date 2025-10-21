@@ -1,0 +1,13 @@
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "./vanity server"
+restartPolicyType = "always"
+numReplicas = 1
+
+[env]
+RUST_LOG = "info"
+RUST_BACKTRACE = "1"
+VANITY_PORT = "8080"

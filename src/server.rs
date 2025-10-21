@@ -1,7 +1,7 @@
 #[cfg(feature = "server")]
 use {
     axum::{
-        extract::State,
+        extract::{Query, State},
         http::StatusCode,
         response::Json,
         routing::get,
@@ -20,6 +20,12 @@ use {
     sha2::{Digest, Sha256},
     solana_pubkey::Pubkey,
 };
+
+#[cfg(feature = "server")]
+#[derive(Debug, Deserialize)]
+pub struct GrindQuery {
+    pub suffix: Option<String>,
+}
 
 #[cfg(feature = "server")]
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -89,21 +95,23 @@ async fn root() -> Json<serde_json::Value> {
             "GET /grind": "Grind vanity addresses synchronously"
         },
         "configuration": {
-            "note": "All grinding parameters are configured via environment variables",
+            "note": "Most grinding parameters are configured via environment variables, suffix is passed as query parameter",
             "required_vars": [
                 "VANITY_DEFAULT_BASE",
                 "VANITY_DEFAULT_OWNER"
             ],
             "optional_vars": [
                 "VANITY_DEFAULT_PREFIX",
-                "VANITY_DEFAULT_SUFFIX", 
                 "VANITY_DEFAULT_CPUS",
                 "VANITY_DEFAULT_CASE_INSENSITIVE",
                 "VANITY_PORT"
+            ],
+            "query_params": [
+                "suffix - Target suffix for vanity addresses (optional)"
             ]
         },
         "example_usage": {
-            "curl": "curl -X GET http://localhost:8080/grind",
+            "curl": "curl -X GET 'http://localhost:8080/grind?suffix=omni'",
             "description": "Returns vanity address result immediately"
         },
         "response_format": {
@@ -133,6 +141,7 @@ async fn health_check() -> Json<serde_json::Value> {
 
 #[cfg(feature = "server")]
 async fn grind_sync(
+    Query(query): Query<GrindQuery>,
     State(_state): State<AppState>,
 ) -> Result<Json<GrindResult>, (StatusCode, Json<serde_json::Value>)> {
     // Get configuration from environment variables
@@ -141,7 +150,7 @@ async fn grind_sync(
     let owner_str = std::env::var("VANITY_DEFAULT_OWNER")
         .unwrap_or_else(|_| "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string());
     let prefix = std::env::var("VANITY_DEFAULT_PREFIX").ok();
-    let suffix = std::env::var("VANITY_DEFAULT_SUFFIX").ok();
+    let suffix = query.suffix;
     let case_insensitive = std::env::var("VANITY_DEFAULT_CASE_INSENSITIVE")
         .unwrap_or_else(|_| "false".to_string())
         .parse()

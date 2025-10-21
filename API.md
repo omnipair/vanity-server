@@ -37,12 +37,15 @@ All parameters are configured via environment variables:
 |----------|--------|-------------|
 | `/` | GET | API documentation |
 | `/health` | GET | Health check |
-| `/grind` | GET | Grind vanity addresses (synchronous) |
+| `/grind?suffix=<target>` | GET | Grind vanity addresses (synchronous) |
 
 ### Grind Vanity Addresses
-**GET** `/grind`
+**GET** `/grind?suffix=<target>`
 
-Returns vanity address result immediately using environment variable configuration.
+Returns vanity address result immediately using environment variable configuration and optional suffix query parameter.
+
+**Query Parameters:**
+- `suffix` (optional): Target suffix for vanity addresses
 
 **Response:**
 ```json
@@ -65,12 +68,12 @@ Returns vanity address result immediately using environment variable configurati
 
 ### curl
 ```bash
-curl -X GET http://localhost:8080/grind
+curl -X GET 'http://localhost:8080/grind?suffix=omni'
 ```
 
 ### JavaScript
 ```javascript
-const response = await fetch('http://localhost:8080/grind');
+const response = await fetch('http://localhost:8080/grind?suffix=omni');
 const result = await response.json();
 console.log('Address:', result.address);
 console.log('Seed:', result.seed);
@@ -80,7 +83,7 @@ console.log('Seed bytes:', result.seed_bytes);
 ### Python
 ```python
 import requests
-response = requests.get('http://localhost:8080/grind')
+response = requests.get('http://localhost:8080/grind', params={'suffix': 'omni'})
 result = response.json()
 print(f"Address: {result['address']}")
 print(f"Seed: {result['seed']}")

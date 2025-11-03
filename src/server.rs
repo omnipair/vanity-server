@@ -79,8 +79,8 @@ fn configure_cors() -> CorsLayer {
         } else {
             // Build CORS layer with allowed origins
             let mut cors = CorsLayer::new()
-                .allow_methods(tower_http::cors::AllowMethods::all())
-                .allow_headers(tower_http::cors::AllowHeaders::all());
+                .allow_methods(tower_http::cors::AllowMethods::any())
+                .allow_headers(tower_http::cors::AllowHeaders::any());
             
             // Add origins - use exact for single, list for multiple
             if origin_list.len() == 1 {

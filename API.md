@@ -24,12 +24,13 @@ All parameters are configured via environment variables:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `VANITY_PORT` | Server port | `8080` |
-| `VANITY_DEFAULT_BASE` | Base pubkey (required) | - |
-| `VANITY_DEFAULT_OWNER` | Owner pubkey (required) | - |
+| `VANITY_DEFAULT_PROGRAM` | Base pubkey (required) | - |
+| `VANITY_DEFAULT_TOKEN_PROGRAM` | Owner pubkey (required) | - |
 | `VANITY_DEFAULT_PREFIX` | Target prefix | - |
 | `VANITY_DEFAULT_SUFFIX` | Target suffix | - |
 | `VANITY_DEFAULT_CPUS` | CPU threads (0=auto) | `0` |
 | `VANITY_DEFAULT_CASE_INSENSITIVE` | Case insensitive | `false` |
+| `VANITY_CORS_ORIGINS` | CORS allowed origins (comma-separated) | Permissive (all origins) |
 
 ## Endpoints
 

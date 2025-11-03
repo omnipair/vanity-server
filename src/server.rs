@@ -8,6 +8,7 @@ use {
         Router,
     },
     serde::{Deserialize, Serialize},
+    tower_http::cors::{CorsLayer, AllowOrigin},
 };
 
 #[cfg(feature = "server")]
@@ -55,6 +56,48 @@ impl AppState {
 }
 
 #[cfg(feature = "server")]
+fn configure_cors() -> CorsLayer {
+    let cors_origins = std::env::var("VANITY_CORS_ORIGINS").ok();
+    
+    if let Some(origins_str) = cors_origins {
+        // Parse comma-separated origins
+        let origins: Vec<String> = origins_str
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        
+        // Parse origins into HeaderValues, filtering out invalid ones
+        let origin_list: Vec<axum::http::HeaderValue> = origins
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        
+        if origin_list.is_empty() {
+            // No valid origins, use permissive CORS
+            CorsLayer::permissive()
+        } else {
+            // Build CORS layer with allowed origins
+            let mut cors = CorsLayer::new()
+                .allow_methods(tower_http::cors::AllowMethods::all())
+                .allow_headers(tower_http::cors::AllowHeaders::all());
+            
+            // Add origins - use exact for single, list for multiple
+            if origin_list.len() == 1 {
+                cors = cors.allow_origin(AllowOrigin::exact(origin_list[0].clone()));
+            } else {
+                cors = cors.allow_origin(AllowOrigin::list(origin_list));
+            }
+            
+            cors
+        }
+    } else {
+        // No CORS config, use permissive CORS
+        CorsLayer::permissive()
+    }
+}
+
+#[cfg(feature = "server")]
 pub async fn start_server(args: crate::ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Load environment variables from .env file
     dotenvy::dotenv().ok(); // Ignore errors if .env file doesn't exist
@@ -66,10 +109,14 @@ pub async fn start_server(args: crate::ServerArgs) -> Result<(), Box<dyn std::er
 
     let app_state = AppState::new();
 
+    // Configure CORS
+    let cors_layer = configure_cors();
+
     let app = Router::new()
         .route("/", get(root))
         .route("/health", get(health_check))
         .route("/grind", get(grind_sync))
+        .layer(cors_layer)
         .with_state(app_state);
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
@@ -97,14 +144,15 @@ async fn root() -> Json<serde_json::Value> {
         "configuration": {
             "note": "Most grinding parameters are configured via environment variables, suffix is passed as query parameter",
             "required_vars": [
-                "VANITY_DEFAULT_BASE",
-                "VANITY_DEFAULT_OWNER"
+                "VANITY_DEFAULT_PROGRAM",
+                "VANITY_DEFAULT_TOKEN_PROGRAM"
             ],
             "optional_vars": [
                 "VANITY_DEFAULT_PREFIX",
                 "VANITY_DEFAULT_CPUS",
                 "VANITY_DEFAULT_CASE_INSENSITIVE",
-                "VANITY_PORT"
+                "VANITY_PORT",
+                "VANITY_CORS_ORIGINS"
             ],
             "query_params": [
                 "suffix - Target suffix for vanity addresses (optional)"
@@ -145,9 +193,9 @@ async fn grind_sync(
     State(_state): State<AppState>,
 ) -> Result<Json<GrindResult>, (StatusCode, Json<serde_json::Value>)> {
     // Get configuration from environment variables
-    let base_str = std::env::var("VANITY_DEFAULT_BASE")
+    let base_str = std::env::var("VANITY_DEFAULT_PROGRAM")
         .unwrap_or_else(|_| "3tJrAXnjofAw8oskbMaSo9oMAYuzdBgVbW3TvQLdMEBd".to_string());
-    let owner_str = std::env::var("VANITY_DEFAULT_OWNER")
+    let owner_str = std::env::var("VANITY_DEFAULT_TOKEN_PROGRAM")
         .unwrap_or_else(|_| "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string());
     let prefix = std::env::var("VANITY_DEFAULT_PREFIX").ok();
     let suffix = query.suffix;

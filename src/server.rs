@@ -25,6 +25,7 @@ use {
 #[cfg(feature = "server")]
 #[derive(Debug, Deserialize)]
 pub struct GrindQuery {
+    pub base: String,
     pub suffix: Option<String>,
 }
 
@@ -123,7 +124,7 @@ pub async fn start_server(args: crate::ServerArgs) -> Result<(), Box<dyn std::er
     println!("🚀 Vanity server running on http://0.0.0.0:{}", port);
     println!("📖 API Documentation:");
     println!("  GET  / - API documentation");
-    println!("  GET  /grind - Grind vanity addresses (uses env vars for config)");
+    println!("  GET  /grind - Grind vanity addresses (base required as query param)");
     println!("  GET  /health - Health check");
 
     axum::serve(listener, app).await?;
@@ -142,9 +143,8 @@ async fn root() -> Json<serde_json::Value> {
             "GET /grind": "Grind vanity addresses synchronously"
         },
         "configuration": {
-            "note": "Most grinding parameters are configured via environment variables, suffix is passed as query parameter",
+            "note": "Base is required as a query parameter. Other parameters can be configured via environment variables.",
             "required_vars": [
-                "VANITY_DEFAULT_PROGRAM",
                 "VANITY_DEFAULT_TOKEN_PROGRAM"
             ],
             "optional_vars": [
@@ -155,11 +155,12 @@ async fn root() -> Json<serde_json::Value> {
                 "VANITY_CORS_ORIGINS"
             ],
             "query_params": [
+                "base - Base pubkey for grinding (required)",
                 "suffix - Target suffix for vanity addresses (optional)"
             ]
         },
         "example_usage": {
-            "curl": "curl -X GET 'http://localhost:8080/grind?suffix=omni'",
+            "curl": "curl -X GET 'http://localhost:8080/grind?base=3tJrAXnjofAw8oskbMaSo9oMAYuzdBgVbW3TvQLdMEBd&suffix=omni'",
             "description": "Returns vanity address result immediately"
         },
         "response_format": {
@@ -192,9 +193,8 @@ async fn grind_sync(
     Query(query): Query<GrindQuery>,
     State(_state): State<AppState>,
 ) -> Result<Json<GrindResult>, (StatusCode, Json<serde_json::Value>)> {
-    // Get configuration from environment variables
-    let base_str = std::env::var("VANITY_DEFAULT_PROGRAM")
-        .unwrap_or_else(|_| "3tJrAXnjofAw8oskbMaSo9oMAYuzdBgVbW3TvQLdMEBd".to_string());
+    // Get configuration from query parameters and environment variables
+    let base_str = query.base;
     let owner_str = std::env::var("VANITY_DEFAULT_TOKEN_PROGRAM")
         .unwrap_or_else(|_| "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string());
     let prefix = std::env::var("VANITY_DEFAULT_PREFIX").ok();
@@ -213,9 +213,9 @@ async fn grind_sync(
         Ok(pk) => pk,
         Err(e) => {
             return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
-                    "error": format!("Invalid base pubkey in config: {}", e)
+                    "error": format!("Invalid base pubkey in query parameter: {}", e)
                 })),
             ));
         }

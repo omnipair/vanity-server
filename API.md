@@ -14,7 +14,7 @@ cp env.example .env
 # Edit .env with your settings
 
 # Grind addresses
-curl -X GET http://localhost:8080/grind
+curl -X GET 'http://localhost:8080/grind?base=3tJrAXnjofAw8oskbMaSo9oMAYuzdBgVbW3TvQLdMEBd'
 ```
 
 ## Configuration
@@ -24,7 +24,6 @@ All parameters are configured via environment variables:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `VANITY_PORT` | Server port | `8080` |
-| `VANITY_DEFAULT_PROGRAM` | Base pubkey (required) | - |
 | `VANITY_DEFAULT_TOKEN_PROGRAM` | Owner pubkey (required) | - |
 | `VANITY_DEFAULT_PREFIX` | Target prefix | - |
 | `VANITY_DEFAULT_SUFFIX` | Target suffix | - |
@@ -38,14 +37,15 @@ All parameters are configured via environment variables:
 |----------|--------|-------------|
 | `/` | GET | API documentation |
 | `/health` | GET | Health check |
-| `/grind?suffix=<target>` | GET | Grind vanity addresses (synchronous) |
+| `/grind?base=<base>&suffix=<target>` | GET | Grind vanity addresses (synchronous) |
 
 ### Grind Vanity Addresses
-**GET** `/grind?suffix=<target>`
+**GET** `/grind?base=<base>&suffix=<target>`
 
-Returns vanity address result immediately using environment variable configuration and optional suffix query parameter.
+Returns vanity address result immediately using query parameters and environment variable configuration.
 
 **Query Parameters:**
+- `base` (required): Base pubkey for grinding
 - `suffix` (optional): Target suffix for vanity addresses
 
 **Response:**
@@ -69,12 +69,12 @@ Returns vanity address result immediately using environment variable configurati
 
 ### curl
 ```bash
-curl -X GET 'http://localhost:8080/grind?suffix=omni'
+curl -X GET 'http://localhost:8080/grind?base=3tJrAXnjofAw8oskbMaSo9oMAYuzdBgVbW3TvQLdMEBd&suffix=omni'
 ```
 
 ### JavaScript
 ```javascript
-const response = await fetch('http://localhost:8080/grind?suffix=omni');
+const response = await fetch('http://localhost:8080/grind?base=3tJrAXnjofAw8oskbMaSo9oMAYuzdBgVbW3TvQLdMEBd&suffix=omni');
 const result = await response.json();
 console.log('Address:', result.address);
 console.log('Seed:', result.seed);
@@ -84,7 +84,10 @@ console.log('Seed bytes:', result.seed_bytes);
 ### Python
 ```python
 import requests
-response = requests.get('http://localhost:8080/grind', params={'suffix': 'omni'})
+response = requests.get('http://localhost:8080/grind', params={
+    'base': '3tJrAXnjofAw8oskbMaSo9oMAYuzdBgVbW3TvQLdMEBd',
+    'suffix': 'omni'
+})
 result = response.json()
 print(f"Address: {result['address']}")
 print(f"Seed: {result['seed']}")

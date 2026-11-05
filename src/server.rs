@@ -8,18 +8,23 @@ use {
         Router,
     },
     serde::{Deserialize, Serialize},
-    tower_http::cors::{CorsLayer, AllowOrigin},
+    tower_http::cors::{AllowOrigin, CorsLayer},
 };
 
 #[cfg(feature = "server")]
 use {
     crate::{array, maybe_bs58_aware_lowercase, parse_pubkey},
-    dotenvy,
-    fd_bs58,
     rand::{self, Rng},
-    rayon,
     sha2::{Digest, Sha256},
     solana_pubkey::Pubkey,
+    std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        },
+        time::{Duration, Instant},
+    },
+    tokio::sync::{OwnedSemaphorePermit, Semaphore},
 };
 
 #[cfg(feature = "server")]
@@ -52,19 +57,156 @@ pub struct GrindResult {
 
 #[cfg(feature = "server")]
 #[derive(Debug, Clone)]
-pub struct AppState;
+pub struct AppState {
+    config: Arc<ServerConfig>,
+    slots: Arc<Semaphore>,
+    start_rate: Arc<Mutex<StartRate>>,
+}
+
+// Covers the existing omni, yLP and hLP suffixes. Count both constraints so a
+// configured prefix cannot silently multiply the permitted request complexity.
+const MAX_TARGET_LENGTH: usize = 4;
+type ApiError = (StatusCode, Json<serde_json::Value>);
+
+#[derive(Debug)]
+struct ServerConfig {
+    owner: Pubkey,
+    prefix: Option<String>,
+    case_insensitive: bool,
+    timeout: Duration,
+    max_concurrent_tasks: usize,
+    requests_per_minute: u32,
+}
+
+impl ServerConfig {
+    fn from_env() -> Result<Self, String> {
+        let owner = parse_pubkey(
+            &std::env::var("VANITY_DEFAULT_TOKEN_PROGRAM")
+                .unwrap_or_else(|_| "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string()),
+        )
+        .map_err(|e| format!("Invalid VANITY_DEFAULT_TOKEN_PROGRAM: {e}"))?;
+        let case_insensitive = std::env::var("VANITY_DEFAULT_CASE_INSENSITIVE")
+            .unwrap_or_else(|_| "false".to_string())
+            .parse::<bool>()
+            .map_err(|_| "VANITY_DEFAULT_CASE_INSENSITIVE must be true or false".to_string())?;
+        let prefix = validate_target(
+            &std::env::var("VANITY_DEFAULT_PREFIX").ok(),
+            case_insensitive,
+        )
+        .map_err(|e| format!("Invalid VANITY_DEFAULT_PREFIX: {e}"))?;
+        Ok(Self {
+            owner,
+            prefix,
+            case_insensitive,
+            timeout: Duration::from_secs(bounded_env("VANITY_TASK_TIMEOUT", 30, 300)? as u64),
+            max_concurrent_tasks: bounded_env("VANITY_MAX_CONCURRENT_TASKS", 1, 64)? as usize,
+            requests_per_minute: bounded_env("VANITY_MAX_REQUESTS_PER_MINUTE", 60, 10_000)?,
+        })
+    }
+}
+
+fn bounded_env(name: &str, default: u32, max: u32) -> Result<u32, String> {
+    match std::env::var(name) {
+        Ok(value) => parse_limit(name, &value, max),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(_) => Err(format!("{name} must be an integer between 1 and {max}")),
+    }
+}
+
+fn parse_limit(name: &str, value: &str, max: u32) -> Result<u32, String> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|n| (1..=max).contains(n))
+        .ok_or_else(|| format!("{name} must be an integer between 1 and {max}"))
+}
+
+// A process-wide token bucket has bounded memory and does not trust client-
+// supplied forwarding headers. Per-client fairness belongs at a trusted proxy.
+#[derive(Debug)]
+struct StartRate {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl StartRate {
+    fn allow(&mut self, now: Instant, per_minute: u32) -> bool {
+        let capacity = f64::from(per_minute);
+        self.tokens = (self.tokens
+            + now.duration_since(self.last_refill).as_secs_f64() * capacity / 60.0)
+            .min(capacity);
+        self.last_refill = now;
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
 
 #[cfg(feature = "server")]
 impl AppState {
-    pub fn new() -> Self {
-        Self
+    fn new(config: ServerConfig) -> Self {
+        Self {
+            slots: Arc::new(Semaphore::new(config.max_concurrent_tasks)),
+            start_rate: Arc::new(Mutex::new(StartRate {
+                tokens: f64::from(config.requests_per_minute),
+                last_refill: Instant::now(),
+            })),
+            config: Arc::new(config),
+        }
     }
+
+    fn admit(&self) -> Result<OwnedSemaphorePermit, ApiError> {
+        // Reject rather than building an unbounded queue of waiting requests.
+        let permit = self.slots.clone().try_acquire_owned().map_err(|_| {
+            api_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Grinding capacity is busy; retry later",
+            )
+        })?;
+        if !self
+            .start_rate
+            .lock()
+            .expect("start rate mutex poisoned")
+            .allow(Instant::now(), self.config.requests_per_minute)
+        {
+            return Err(api_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Grinding start rate exceeded; retry later",
+            ));
+        }
+        Ok(permit)
+    }
+}
+
+fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
+    (status, Json(serde_json::json!({ "error": message.into() })))
+}
+
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+struct WorkBudget {
+    deadline: Instant,
+    cancelled: Arc<AtomicBool>,
+}
+
+#[derive(Debug, PartialEq)]
+enum GrindError {
+    TimedOut,
+    Cancelled,
 }
 
 #[cfg(feature = "server")]
 fn configure_cors() -> CorsLayer {
     let cors_origins = std::env::var("VANITY_CORS_ORIGINS").ok();
-    
+
     if let Some(origins_str) = cors_origins {
         // Parse comma-separated origins
         let origins: Vec<String> = origins_str
@@ -72,13 +214,11 @@ fn configure_cors() -> CorsLayer {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        
+
         // Parse origins into HeaderValues, filtering out invalid ones
-        let origin_list: Vec<axum::http::HeaderValue> = origins
-            .iter()
-            .filter_map(|s| s.parse().ok())
-            .collect();
-        
+        let origin_list: Vec<axum::http::HeaderValue> =
+            origins.iter().filter_map(|s| s.parse().ok()).collect();
+
         if origin_list.is_empty() {
             // No valid origins, use permissive CORS
             CorsLayer::permissive()
@@ -87,14 +227,14 @@ fn configure_cors() -> CorsLayer {
             let mut cors = CorsLayer::new()
                 .allow_methods(tower_http::cors::AllowMethods::any())
                 .allow_headers(tower_http::cors::AllowHeaders::any());
-            
+
             // Add origins - use exact for single, list for multiple
             if origin_list.len() == 1 {
                 cors = cors.allow_origin(AllowOrigin::exact(origin_list[0].clone()));
             } else {
                 cors = cors.allow_origin(AllowOrigin::list(origin_list));
             }
-            
+
             cors
         }
     } else {
@@ -109,21 +249,18 @@ pub async fn start_server(args: crate::ServerArgs) -> Result<(), Box<dyn std::er
     dotenvy::dotenv().ok(); // Ignore errors if .env file doesn't exist
 
     // Determine port: CLI arg > env var > default
-    let port = args.port
-        .or_else(|| std::env::var("VANITY_PORT").ok().and_then(|s| s.parse().ok()))
+    let port = args
+        .port
+        .or_else(|| {
+            std::env::var("VANITY_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
         .unwrap_or(8080);
 
-    let app_state = AppState::new();
+    let app_state = AppState::new(ServerConfig::from_env()?);
 
-    // Configure CORS
-    let cors_layer = configure_cors();
-
-    let app = Router::new()
-        .route("/", get(root))
-        .route("/health", get(health_check))
-        .route("/grind", get(grind_sync))
-        .layer(cors_layer)
-        .with_state(app_state);
+    let app = router(app_state);
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
     println!("🚀 Vanity server running on http://0.0.0.0:{}", port);
@@ -149,26 +286,27 @@ async fn root() -> Json<serde_json::Value> {
         },
         "configuration": {
             "note": "Base is required as a query parameter. Other parameters can be configured via environment variables.",
-            "required_vars": [
-                "VANITY_DEFAULT_TOKEN_PROGRAM"
-            ],
+            "required_vars": [],
             "optional_vars": [
+                "VANITY_DEFAULT_TOKEN_PROGRAM",
                 "VANITY_DEFAULT_PREFIX",
-                "VANITY_DEFAULT_CPUS",
                 "VANITY_DEFAULT_CASE_INSENSITIVE",
+                "VANITY_TASK_TIMEOUT",
+                "VANITY_MAX_CONCURRENT_TASKS",
+                "VANITY_MAX_REQUESTS_PER_MINUTE",
                 "VANITY_PORT",
                 "VANITY_CORS_ORIGINS"
             ],
             "query_params": [
                 "base - Base pubkey for grinding (required)",
-                "suffix - Target suffix for vanity addresses (optional)",
+                "suffix - Target suffix (optional; prefix + suffix must total at most 4 Base58 characters)",
                 "owner - Program that will own the created account (optional; defaults to VANITY_DEFAULT_TOKEN_PROGRAM). Token-2022 mints pass TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
             ]
         },
         "example_usage": {
             "curl": "curl -X GET 'http://localhost:8080/grind?base=3tJrAXnjofAw8oskbMaSo9oMAYuzdBgVbW3TvQLdMEBd&suffix=omni'",
             "curl_token_2022": "curl -X GET 'http://localhost:8080/grind?base=3tJrAXnjofAw8oskbMaSo9oMAYuzdBgVbW3TvQLdMEBd&suffix=yLP&owner=TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'",
-            "description": "Returns vanity address result immediately"
+            "description": "Returns a matching address within the configured time budget, or a controlled error"
         },
         "response_format": {
             "address": "Generated vanity address",
@@ -198,91 +336,62 @@ async fn health_check() -> Json<serde_json::Value> {
 #[cfg(feature = "server")]
 async fn grind_sync(
     Query(query): Query<GrindQuery>,
-    State(_state): State<AppState>,
-) -> Result<Json<GrindResult>, (StatusCode, Json<serde_json::Value>)> {
-    // Get configuration from query parameters and environment variables
-    let base_str = query.base;
-    let owner_from_query = query.owner.filter(|owner| !owner.trim().is_empty());
-    let owner_str = owner_from_query.clone().unwrap_or_else(|| {
-        std::env::var("VANITY_DEFAULT_TOKEN_PROGRAM")
-            .unwrap_or_else(|_| "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string())
+    State(state): State<AppState>,
+) -> Result<Json<GrindResult>, ApiError> {
+    let config = &state.config;
+    let base = parse_pubkey(&query.base)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, format!("Invalid base pubkey: {e}")))?;
+    let owner = match query.owner.filter(|owner| !owner.trim().is_empty()) {
+        Some(owner) => parse_pubkey(&owner).map_err(|e| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                format!("Invalid owner pubkey: {e}"),
+            )
+        })?,
+        None => config.owner,
+    };
+    let suffix = validate_target(&query.suffix, config.case_insensitive)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
+    let prefix = config.prefix.clone();
+    if prefix.as_deref().unwrap_or("").len() + suffix.as_deref().unwrap_or("").len()
+        > MAX_TARGET_LENGTH
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Prefix and suffix together must not exceed 4 Base58 characters",
+        ));
+    }
+
+    let permit = state.admit()?;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    // Dropping an HTTP handler does not stop spawn_blocking. Signal the worker
+    // explicitly on disconnect, handler cancellation, or an elapsed timeout.
+    let _cancel_on_drop = CancelOnDrop(cancelled.clone());
+    let budget = WorkBudget {
+        deadline: Instant::now() + config.timeout,
+        cancelled,
+    };
+    let case_insensitive = config.case_insensitive;
+    let worker = tokio::task::spawn_blocking(move || {
+        // Capacity is released only when computation actually stops, even if
+        // the HTTP handler has already returned or has been dropped.
+        let _permit = permit;
+        grind_sync_blocking(base, owner, prefix, suffix, case_insensitive, budget)
     });
-    let prefix = std::env::var("VANITY_DEFAULT_PREFIX").ok();
-    let suffix = query.suffix;
-    let case_insensitive = std::env::var("VANITY_DEFAULT_CASE_INSENSITIVE")
-        .unwrap_or_else(|_| "false".to_string())
-        .parse()
-        .unwrap_or(false);
-    let num_cpus = std::env::var("VANITY_DEFAULT_CPUS")
-        .unwrap_or_else(|_| "0".to_string())
-        .parse()
-        .unwrap_or(0);
 
-    // Validate pubkeys
-    let base = match parse_pubkey(&base_str) {
-        Ok(pk) => pk,
-        Err(e) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": format!("Invalid base pubkey in query parameter: {}", e)
-                })),
-            ));
-        }
-    };
-
-    let owner = match parse_pubkey(&owner_str) {
-        Ok(pk) => pk,
-        Err(e) if owner_from_query.is_some() => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": format!("Invalid owner pubkey in query parameter: {}", e)
-                })),
-            ));
-        }
-        Err(e) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!("Invalid owner pubkey in config: {}", e)
-                })),
-            ));
-        }
-    };
-
-    // Validate prefix/suffix
-    let prefix_validated = validate_target(&prefix, case_insensitive);
-    let suffix_validated = validate_target(&suffix, case_insensitive);
-
-    // Run grinding synchronously
-    let result = tokio::task::spawn_blocking(move || {
-        grind_sync_blocking(
-            base,
-            owner,
-            prefix_validated,
-            suffix_validated,
-            case_insensitive,
-            num_cpus,
-        )
-    })
-    .await
-    .map_err(|e| {
-        (
+    match tokio::time::timeout(config.timeout, worker).await {
+        Ok(Ok(Ok(result))) => Ok(Json(result)),
+        Err(_) | Ok(Ok(Err(GrindError::TimedOut))) => Err(api_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "Grinding time budget exceeded",
+        )),
+        Ok(Ok(Err(GrindError::Cancelled))) => Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Grinding was cancelled",
+        )),
+        Ok(Err(e)) => Err(api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("Grinding task failed: {}", e)
-            })),
-        )
-    })?;
-
-    match result {
-        Ok(grind_result) => Ok(Json(grind_result)),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("Grinding failed: {}", e)
-            })),
+            format!("Grinding task failed: {e}"),
         )),
     }
 }
@@ -294,113 +403,96 @@ fn grind_sync_blocking(
     prefix: Option<String>,
     suffix: Option<String>,
     case_insensitive: bool,
-    num_cpus: u32,
-) -> Result<GrindResult, String> {
-    let start_time = std::time::Instant::now();
-    let mut num_cpus = num_cpus;
-    
-    // Auto-detect CPU threads if 0
-    if num_cpus == 0 {
-        num_cpus = rayon::current_num_threads() as u32;
-    }
-
+    budget: WorkBudget,
+) -> Result<GrindResult, GrindError> {
+    let start_time = Instant::now();
     let prefix_str = prefix.as_deref().unwrap_or("").to_string();
     let suffix_str = suffix.as_deref().unwrap_or("").to_string();
-    let exit_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let result_arc = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let base_sha = Sha256::new().chain_update(base);
+    let mut count = 0_u64;
 
-    // Start CPU grinding
-    let base_clone = base;
-    let owner_clone = owner;
-    let prefix_clone = prefix.clone();
-    let suffix_clone = suffix.clone();
-    let exit_flag_clone = exit_flag.clone();
-    let result_clone = result_arc.clone();
-
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(num_cpus as usize)
-        .build_global()
-        .unwrap_or_else(|_| {
-            // Thread pool already initialized, continue with current settings
-        });
-
-    let cpu_handle = std::thread::spawn(move || {
-        let base_sha = Sha256::new().chain_update(base_clone);
-        let mut count = 0_u64;
-
-        loop {
-            if exit_flag_clone.load(std::sync::atomic::Ordering::Acquire) {
-                return;
+    loop {
+        // Check before starting and at bounded intervals while hashing. The
+        // deadline is enforced here as well as in the async HTTP handler.
+        if count % 1024 == 0 {
+            if budget.cancelled.load(Ordering::Acquire) {
+                return Err(GrindError::Cancelled);
             }
-
-            let mut seed_iter = rand::thread_rng().sample_iter(&rand::distributions::Alphanumeric).take(16);
-            let seed: [u8; 16] = array::from_fn(|_| seed_iter.next().unwrap());
-
-            let pubkey_bytes: [u8; 32] = base_sha
-                .clone()
-                .chain_update(seed)
-                .chain_update(owner_clone)
-                .finalize()
-                .into();
-            let pubkey = fd_bs58::encode_32(pubkey_bytes);
-            let out_str_target_check = maybe_bs58_aware_lowercase(&pubkey, case_insensitive);
-
-            count += 1;
-
-            // Check if we found the target
-            if out_str_target_check.starts_with(&prefix_str) && out_str_target_check.ends_with(&suffix_str) {
-                let time_secs = start_time.elapsed().as_secs_f64();
-                let attempts_per_second = (count as f64 / time_secs) as u64;
-
-                let result = GrindResult {
-                    address: pubkey,
-                    seed: String::from_utf8_lossy(&seed).to_string(),
-                    seed_bytes: seed.to_vec(),
-                    base: base_clone.to_string(),
-                    owner: owner_clone.to_string(),
-                    prefix: prefix_clone,
-                    suffix: suffix_clone,
-                    case_insensitive,
-                    attempts: count,
-                    duration_seconds: time_secs,
-                    attempts_per_second,
-                };
-
-                *result_clone.lock().unwrap() = Some(result);
-                exit_flag_clone.store(true, std::sync::atomic::Ordering::Release);
-                return;
+            if Instant::now() >= budget.deadline {
+                return Err(GrindError::TimedOut);
             }
         }
-    });
 
-    // Wait for completion or timeout
-    let result = cpu_handle.join();
+        let mut seed_iter = rand::thread_rng()
+            .sample_iter(&rand::distributions::Alphanumeric)
+            .take(16);
+        let seed: [u8; 16] = array::from_fn(|_| seed_iter.next().unwrap());
 
-    match result {
-        Ok(_) => {
-            if let Some(grind_result) = result_arc.lock().unwrap().take() {
-                Ok(grind_result)
-            } else {
-                Err("Grinding timed out after 5 minutes".to_string())
-            }
+        let pubkey_bytes: [u8; 32] = base_sha
+            .clone()
+            .chain_update(seed)
+            .chain_update(owner)
+            .finalize()
+            .into();
+        let pubkey = fd_bs58::encode_32(pubkey_bytes);
+        let out_str_target_check = maybe_bs58_aware_lowercase(&pubkey, case_insensitive);
+
+        count += 1;
+
+        if out_str_target_check.starts_with(&prefix_str)
+            && out_str_target_check.ends_with(&suffix_str)
+        {
+            let time_secs = start_time.elapsed().as_secs_f64();
+            return Ok(GrindResult {
+                address: pubkey,
+                seed: String::from_utf8_lossy(&seed).to_string(),
+                seed_bytes: seed.to_vec(),
+                base: base.to_string(),
+                owner: owner.to_string(),
+                prefix,
+                suffix,
+                case_insensitive,
+                attempts: count,
+                duration_seconds: time_secs,
+                attempts_per_second: (count as f64 / time_secs) as u64,
+            });
         }
-        Err(_) => Err("Grinding thread panicked".to_string()),
     }
 }
 
-
 #[cfg(feature = "server")]
-fn validate_target(target: &Option<String>, case_insensitive: bool) -> Option<String> {
+fn validate_target(
+    target: &Option<String>,
+    case_insensitive: bool,
+) -> Result<Option<String>, String> {
     const BS58_CHARS: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
     if let Some(ref target_str) = target {
+        if target_str.len() > MAX_TARGET_LENGTH {
+            return Err("Target must not exceed 4 Base58 characters".to_string());
+        }
         for c in target_str.chars() {
             if !BS58_CHARS.contains(c) {
-                return None;
+                return Err("Target must contain only Base58 characters".to_string());
             }
         }
-        Some(maybe_bs58_aware_lowercase(target_str, case_insensitive))
+        Ok(Some(maybe_bs58_aware_lowercase(
+            target_str,
+            case_insensitive,
+        )))
     } else {
-        None
+        Ok(None)
     }
 }
+
+fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/", get(root))
+        .route("/health", get(health_check))
+        .route("/grind", get(grind_sync))
+        .layer(configure_cors())
+        .with_state(state)
+}
+
+#[cfg(test)]
+mod tests;

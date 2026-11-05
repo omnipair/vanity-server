@@ -79,7 +79,7 @@ curl -X GET http://localhost:8080/
 
 **Grind vanity addresses (synchronous):**
 ```bash
-curl -X GET http://localhost:8080/grind
+curl 'http://localhost:8080/grind?base=3tJrAXnjofAw8oskbMaSo9oMAYuzdBgVbW3TvQLdMEBd&suffix=omni'
 ```
 
 **Health check:**
@@ -101,6 +101,16 @@ cp .env.example .env
 Available environment variables:
 - `VANITY_PORT` - Server port (default: 8080)
 - Additional variables documented in `.env.example`
+
+HTTP grinding accepts at most four Base58 characters across the configured
+prefix and requested suffix. By default, each instance allows one active job,
+enforces a 30-second job deadline, and admits jobs through a token bucket with a
+60-job burst and 60 jobs/minute refill. Busy or rate-limited requests receive
+`429`; an expired job receives `504`. CPU workers also stop when their HTTP
+handlers are cancelled. See [API.md](API.md#resource-limits-and-errors) for
+configuration, proxy considerations, and retry behavior.
+
+Run the server regression tests with `cargo test --locked --features server`.
 
 ## Contributions
 
